@@ -326,7 +326,7 @@ class GitExtractor(GenericExtractor):
             commit.rev = do("git describe %s 2>/dev/null" % shellquote(commit.commit))
         if not commit.rev:
             # Query git for the abbreviated hash
-            commit.rev = do("git log -1 '--pretty=format:%h' " + shellquote(commit.commit))
+            commit.rev = do("git log -1 '--no-show-signature' '--pretty=format:%h' " + shellquote(commit.commit))
             if self.urlprefix in ('gitweb', 'cgit'):
                 # Also truncate the commit used for the announced urls
                 commit.commit = commit.rev
@@ -337,14 +337,14 @@ class GitExtractor(GenericExtractor):
         # conventionally supposed to be a summary of the commit.  Under
         # other VCSes a different choice may be appropriate.
         commit.author_name, commit.mail, commit.logmsg = \
-            do("git log -1 '--pretty=format:%an%n%ae%n%s' " + shellquote(commit.commit)).split("\n")
+            do("git log -1 '--no-show-signature' '--pretty=format:%an%n%ae%n%s' " + shellquote(commit.commit)).split("\n")
         # This discards the part of the author's address after @.
         # Might be be nice to ship the full email address, if not
         # for spammers' address harvesters - getting this wrong
         # would make the freenode #commits channel into harvester heaven.
         commit.author = commit.mail.split("@")[0]
         commit.author_date, commit.commit_date = \
-            do("git log -1 '--pretty=format:%ai|%ci' " + shellquote(commit.commit)).split("|")
+            do("git log -1 '--no-show-signature' '--pretty=format:%ai|%ci' " + shellquote(commit.commit)).split("|")
         return commit
 
 class SvnExtractor(GenericExtractor):
