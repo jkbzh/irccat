@@ -266,7 +266,7 @@ class IRCServerConnection():
         self.socket = None
 
     # PROTOCOL_TLS_SERVER selects the highest version that both client and server support
-    def _wrap_socket(self, socket, target, certfile=None, cafile=None,
+    def _wrap_socket(self, socket, target, certfile=None, cafile=None, capath=None,
                      protocol=ssl.PROTOCOL_TLS_CLIENT):
         try:  # Python 3.2 and greater
             ssl_context = ssl.SSLContext(protocol)
@@ -280,8 +280,8 @@ class IRCServerConnection():
             ssl_context.check_hostname = True
             if certfile:
                 ssl_context.load_cert_chain(certfile)
-            if cafile:
-                ssl_context.load_verify_locations(cafile=cafile)
+            if cafile or capath:
+                ssl_context.load_verify_locations(cafile=cafile, capath=capath)
             else:
                 ssl_context.set_default_verify_paths()
             kwargs = {}
@@ -1024,9 +1024,13 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(
         description=__doc__.strip().splitlines()[0])
     password_group = parser.add_mutually_exclusive_group()
-    parser.add_argument(
+    ca_group = parser.add_mutually_exclusive_group()
+    ca_group.add_argument(
         '-c', '--ca-file', metavar='PATH',
         help='file of trusted certificates for SSL/TLS')
+    ca_group.add_argument(
+        '-C', '--ca-path', metavar='PATH',
+        help='path to directory holding trusted certificates for SSL/TLS')
     parser.add_argument(
         '-e', '--cert-file', metavar='PATH',
         help='pem file used to authenticate to the server')
@@ -1090,6 +1094,7 @@ if __name__ == '__main__':
         nick_needs_number=re.search('%.*d', args.nick),
         password=args.password,
         cafile=args.ca_file,
+        capath=args.ca_path,
         certfile=args.cert_file,
         timeout=args.timeout,
         )
