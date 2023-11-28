@@ -1125,6 +1125,11 @@ if __name__ == '__main__':
             try:
                 signal.pause()
             except KeyboardInterrupt:
+                # close all open sockets
+                tcpserver.server_close()
+                udpserver.server_close()
+                tcp6server.server_close()
+                udp6server.server_close()
                 raise SystemExit(1)
         except socket.error as e:
             LOG.error("irkerd: server launch failed: %r\n" % e)
