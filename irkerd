@@ -219,8 +219,9 @@ class IRCClient():
 
     def drop_connection(self, connection):
         with self.mutex:
-            self.server_connections.remove(connection)
-            self.drops += 1
+            if connection in self.server_connections:
+                self.server_connections.remove(connection)
+                self.drops += 1
 
 class LineBufferedStream():
     "Line-buffer a read stream."
