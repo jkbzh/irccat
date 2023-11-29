@@ -3,6 +3,7 @@
 
 # Python bits
 /*.pyc
+__pycache__
 
 # Man Pages
 /*.8
