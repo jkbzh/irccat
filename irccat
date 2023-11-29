@@ -96,9 +96,9 @@ def ssl_context_init(ca_file = None, ca_path = None, cert_file = None):
     else:
         ssl_context.set_default_verify_paths()
 
-    LOG.info(f"ctx cert file {cert_file}")
-    LOG.info(f"ctxca file {ca_file}")
-    LOG.info(f"ctx ca path {ca_path}")
+    LOG.info("ctx cert file %s", cert_file)
+    LOG.info("ctxca file %s", ca_file)
+    LOG.info("ctx ca path %s", ca_path)
 
     #context.load_cert_chain(certfile,
     #                    keyfile = cert_file)
@@ -139,6 +139,13 @@ if __name__ == '__main__':
     parser.add_argument(
         '-H6', '--host6', metavar='ADDRESS', default=HOST,
         help='IPv6 address to listen on')
+    parser.add_argument(
+        '-hp', '--port', metavar='NAME', default=PORT, type=int,
+        help="host port to listen to for incoming requests")
+    parser.add_argument(
+        '-ic', '--irc-channel', metavar='LIST', action="extend", nargs='+',
+        type=str,
+        help='list of irc channels irccat can connect to')
     parser.add_argument(
         '-l', '--log-file', metavar='PATH',
         help='file for saving captured message traffic')
@@ -194,7 +201,7 @@ if __name__ == '__main__':
         certfile=args.cert_file,
         timeout=args.timeout,
         )
-    LOG.info(f"ircat/irkerd version {version}/{irkerd_version}")
+    LOG.info("ircat/irkerd %s/%s", version, irkerd_version)
     if args.immediate:
         if not args.message:
             # We want newline to become '\n' and tab to become '\t';
