@@ -1,0 +1,236 @@
+#!/usr/bin/env python3
+"""
+
+irctalk - an irccat clone built on top of irkerd
+
+Listens for JSON objects of the form {'to':<irc-url>, 'privmsg':<text>}
+and relays messages to IRC channels. Each request must be followed by
+a newline.
+
+The <text> must be a string.  The value of the 'to' attribute can be a
+string containing an IRC URL (e.g. 'irc://chat.freenet.net/botwar') or
+a list of such strings; in the latter case the message is broadcast to
+all listed channels.  Note that the channel portion of the URL need
+*not* have a leading '#' unless the channel name itself does.
+
+Design and code by Eric S. Raymond <esr@thyrsus.com>. See the project
+resource page at <http://www.catb.org/~esr/irker/>.
+
+Requires Python 3.x
+
+"""
+# SPDX-License-Identifier: BSD-2-Clause
+
+# These things might need tuning
+
+HOST = "localhost"
+HOST6 = "localhost"
+PORT = 6659
+
+PROXY_TYPE = None # Use proxy if set 1: SOCKS4, 2: SOCKS5, 3: HTTP
+PROXY_HOST = ""
+PROXY_PORT = 1080
+
+XMIT_TTL = (3 * 60 * 60)	# Time to live, seconds from last transmit
+PING_TTL = (15 * 60)		# Time to live, seconds from last PING
+HANDSHAKE_TTL = 60		# Time to live, seconds from nick transmit
+CHANNEL_TTL = (3 * 60 * 60)	# Time to live, seconds from last transmit
+DISCONNECT_TTL = (24 * 60 * 60)	# Time to live, seconds from last connect
+UNSEEN_TTL = 60			# Time to live, seconds since first request
+CHANNEL_MAX = 18		# Max channels open per socket (default)
+ANTI_FLOOD_DELAY = 1.0		# Anti-flood delay after transmissions, seconds
+ANTI_BUZZ_DELAY = 0.09		# Anti-buzz delay after queue-empty check
+CONNECTION_MAX = 200		# To avoid hitting a thread limit
+RECONNECT_DELAY = 3		# Don't spam servers with connection attempts
+
+# No user-serviceable parts below this line
+
+# pylint: disable=too-many-lines,invalid-name,missing-function-docstring,missing-class-docstring,redefined-outer-name,logging-not-lazy,too-many-arguments,too-many-branches,too-many-instance-attributes,attribute-defined-outside-init,raise-missing-from,no-else-return,no-else-break,too-many-statements,too-many-nested-blocks,no-self-use,consider-using-f-string,redundant-u-string-prefix
+
+version = "0.01"
+irkerd_version = "2.23"
+
+# pylint: disable=wrong-import-position
+import argparse
+import logging
+import logging.handlers
+import json
+import os
+import os.path
+import queue
+import random
+import re
+import select
+import signal
+import socket
+try:
+    import socks
+    socks_on = True
+except ImportError:
+    socks_on = False
+import socketserver
+import ssl
+import sys
+import threading
+import time
+import traceback
+import urllib.parse as urllib_parse
+from irkerd import Irker, IrkerTCPHandler
+
+LOG = logging.getLogger(__name__)
+LOG.setLevel(logging.ERROR)
+LOG_LEVELS = ['critical', 'error', 'warning', 'info', 'debug']
+
+UNICODE_TYPE = str
+
+class Irccat(Irker):
+    nothing = True
+
+def ssl_context_init(ca_file = None, ca_path = None, cert_file = None):
+    # Create a context to consolidate SSL settings
+    ssl_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    if cert_file:
+        ssl_context.load_cert_chain(cert_file)
+    if ca_file or ca_path:
+        ssl_context.load_verify_locations(cafile=ca_file, capath=ca_path)
+    else:
+        ssl_context.set_default_verify_paths()
+
+    LOG.info(f"ctx cert file {cert_file}")
+    LOG.info(f"ctxca file {ca_file}")
+    LOG.info(f"ctx ca path {ca_path}")
+
+    #context.load_cert_chain(certfile,
+    #                    keyfile = cert_file)
+
+    # only for debugging as i'm not in the SNI
+    # add this as a param
+    ssl_context.verify_mode = ssl.CERT_NONE
+
+    return ssl_context
+
+def in_background():
+    "Is this process running in background?"
+    try:
+        return os.getpgrp() != os.tcgetpgrp(1)
+    except OSError:
+        return True
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(
+        description=__doc__.strip().splitlines()[0])
+    password_group = parser.add_mutually_exclusive_group()
+    ca_group = parser.add_mutually_exclusive_group()
+    ca_group.add_argument(
+        '-c', '--ca-file', metavar='PATH',
+        help='file of trusted certificates for SSL/TLS')
+    ca_group.add_argument(
+        '-C', '--ca-path', metavar='PATH',
+        help='path to directory holding trusted certificates for SSL/TLS')
+    parser.add_argument(
+        '-e', '--cert-file', metavar='PATH',
+        help='pem file used to authenticate to the server')
+    parser.add_argument(
+        '-d', '--log-level', metavar='LEVEL', choices=LOG_LEVELS,
+        help='how much to log to the log file (one of %(choices)s)')
+    parser.add_argument(
+        '-H', '--host', metavar='ADDRESS', default=HOST,
+        help='IP address to listen on')
+    parser.add_argument(
+        '-H6', '--host6', metavar='ADDRESS', default=HOST,
+        help='IPv6 address to listen on')
+    parser.add_argument(
+        '-l', '--log-file', metavar='PATH',
+        help='file for saving captured message traffic')
+    parser.add_argument(
+        '-n', '--nick', metavar='NAME', default='irccat%03d',
+        help="nickname (optionally with a '%%.*d' server connection marker)")
+    password_group.add_argument(
+        '-p', '--password', metavar='PASSWORD',
+        help='NickServ password')
+    password_group.add_argument(
+        '-P', '--password-file', metavar='PATH', type=argparse.FileType('r'),
+        help='NickServ password from file')
+    parser.add_argument(
+        '-t', '--timeout', metavar='TIMEOUT', type=float, default=5.0,
+        help="connection timeout in seconds (default: 5.0)")
+    parser.add_argument(
+        '-i', '--immediate', metavar='IRC-URL',
+        help=(
+            'send a single message to IRC-URL and exit.  The message is the '
+            'first positional argument.'))
+    parser.add_argument(
+        '-V', '--version', action='version',
+        version='%(prog)s {0}'.format(version))
+    parser.add_argument(
+        'message', metavar='MESSAGE', nargs='?',
+        help='message for --immediate mode')
+    args = parser.parse_args()
+
+    if not args.log_file and in_background():
+        # There's a case for falling back to address = ('localhost', 514)
+        # But some systems (including OS X) disable this for security reasons.
+        handler = logging.handlers.SysLogHandler(facility='daemon')
+    else:
+        handler = logging.StreamHandler()
+
+    LOG.addHandler(handler)
+    if args.log_level:
+        log_level = getattr(logging, args.log_level.upper())
+        LOG.setLevel(log_level)
+
+    if args.password_file:
+        with args.file as f:
+            # IRC passwords must be at most 128 bytes, and cannot contain a \n
+            args.password = f.read(128).split("\n")[0].strip()
+
+    irccat = Irccat(
+        logfile=args.log_file,
+        nick_template=args.nick,
+        nick_needs_number=re.search('%.*d', args.nick),
+        password=args.password,
+        cafile=args.ca_file,
+        capath=args.ca_path,
+        certfile=args.cert_file,
+        timeout=args.timeout,
+        )
+    LOG.info(f"ircat/irkerd version {version}/{irkerd_version}")
+    if args.immediate:
+        if not args.message:
+            # We want newline to become '\n' and tab to become '\t';
+            # the JSON decoder will undo these transformations.
+            # This will also encode backslash, backspace, formfeed,
+            # and high-half characters, which might produce unexpected
+            # results on output.
+            args.message = sys.stdin.read().encode("string_escape")
+        irccat.irc.add_event_handler("quit", lambda _c, _e: sys.exit(0))
+        irccat.handle('{"to":"%s","privmsg":"%s"}' % (
+            args.immediate, args.message), quit_after=True)
+        irccat.irc.spin(immediate=True)
+    else:
+        if args.message:
+            LOG.error(
+                'irccat: message argument given (%r), but --immediate not set' % (
+                args.message))
+            raise SystemExit(1)
+        irccat.thread_launch()
+        try:
+            tcpserver = socketserver.TCPServer((args.host, PORT), IrkerTCPHandler)
+            tcpserver.socket = context.wrap_socket (tcpserver.socket, server_side = True)
+            # pylint: disable=undefined-variable
+            tcp6server = TCP6Server((args.host6, PORT), IrkerTCPHandler)
+            tcp6server.socket = context.wrap_socket (tcp6server.socket, server_side = True)
+            for server in [tcpserver, tcp6server]:
+                server = threading.Thread(target=server.serve_forever, daemon=True)
+                server.start()
+            try:
+                signal.pause()
+            except KeyboardInterrupt:
+                # close all open sockets
+                tcpserver.server_close()
+                tcp6server.server_close()
+                raise SystemExit(1)
+        except socket.error as e:
+            LOG.error("irccat: server launch failed: %r\n" % e)
+
+# end
