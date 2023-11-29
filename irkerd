@@ -267,7 +267,7 @@ class IRCServerConnection():
 
     # PROTOCOL_TLS_SERVER selects the highest version that both client and server support
     def _wrap_socket(self, socket, target, certfile=None, cafile=None, capath=None,
-                     protocol=ssl.PROTOCOL_TLS_CLIENT):
+                     protocol=ssl.PROTOCOL_TLS_CLIENT, **kwargs):
         try:  # Python 3.2 and greater
             ssl_context = ssl.SSLContext(protocol)
         except AttributeError:  # Python < 3.2
