@@ -1,20 +1,21 @@
 #!/usr/bin/env python3
-"""
+"""irccat - an irccat clone that uses TLS built on top of irkerd
 
-irctalk - an irccat clone built on top of irkerd
+Listens for JSON objects of the form
 
-Listens for JSON objects of the form {'to':<irc-url>, 'privmsg':<text>}
+{'to':<irc-channel>, 'privmsg':<text>}
+
 and relays messages to IRC channels. Each request must be followed by
 a newline.
 
-The <text> must be a string.  The value of the 'to' attribute can be a
-string containing an IRC URL (e.g. 'irc://chat.freenet.net/botwar') or
-a list of such strings; in the latter case the message is broadcast to
-all listed channels.  Note that the channel portion of the URL need
-*not* have a leading '#' unless the channel name itself does.
+The <text> must be a string.  The value of the 'to' should be a string
+containing the full irc channel name, including the leading characters
+('#', '&') (e.g. #foo, &foo).
 
-Design and code by Eric S. Raymond <esr@thyrsus.com>. See the project
-resource page at <http://www.catb.org/~esr/irker/>.
+The target irc server and port can be configured. All communications
+to irccat as well as from irccat to the irc server are encrypted (TLS).
+
+Author: Jose Kahan (W3C): Nov 2023
 
 Requires Python 3.x
 
@@ -23,20 +24,20 @@ Requires Python 3.x
 
 # These things might need tuning
 
+IRC_HOST = "localhost"
+IRC_PORT = "6697"
+
 HOST = "localhost"
 HOST6 = "localhost"
 PORT = 6659
 
-PROXY_TYPE = None # Use proxy if set 1: SOCKS4, 2: SOCKS5, 3: HTTP
-PROXY_HOST = ""
-PROXY_PORT = 1080
-
-XMIT_TTL = (3 * 60 * 60)	# Time to live, seconds from last transmit
+# one month max idle time between messages before temp disconnecting
+XMIT_TTL = (30 * 24 * 60 * 60)	# Time to live, seconds from last transmit
 PING_TTL = (15 * 60)		# Time to live, seconds from last PING
 HANDSHAKE_TTL = 60		# Time to live, seconds from nick transmit
 CHANNEL_TTL = (3 * 60 * 60)	# Time to live, seconds from last transmit
 DISCONNECT_TTL = (24 * 60 * 60)	# Time to live, seconds from last connect
-UNSEEN_TTL = 60			# Time to live, seconds since first request
+UNSEEN_TTL = 60 		# Time to live, seconds since first request
 CHANNEL_MAX = 18		# Max channels open per socket (default)
 ANTI_FLOOD_DELAY = 1.0		# Anti-flood delay after transmissions, seconds
 ANTI_BUZZ_DELAY = 0.09		# Anti-buzz delay after queue-empty check
@@ -57,34 +58,157 @@ import logging.handlers
 import json
 import os
 import os.path
-import queue
-import random
 import re
-import select
 import signal
 import socket
-try:
-    import socks
-    socks_on = True
-except ImportError:
-    socks_on = False
 import socketserver
 import ssl
 import sys
 import threading
-import time
-import traceback
-import urllib.parse as urllib_parse
-from irkerd import Irker, IrkerTCPHandler
+
+import irkerd
+from irkerd import (InvalidRequest, Irker, Target, Dispatcher,
+                    TCP6Server)
+
+# inform irkerd of our network configuration choices
+irkerd.XMIT_TTL = XMIT_TTL
+irkerd.PING_TTL = PING_TTL
+irkerd.HANDSHAKE_TTL = HANDSHAKE_TTL
+irkerd.CHANNEL_TTL = CHANNEL_TTL
+irkerd.DISCONNECT_TTL = DISCONNECT_TTL
+irkerd.UNSEEN_TTL = UNSEEN_TTL
+irkerd.CHANNEL_MAX = CHANNEL_MAX
+irkerd.ANTI_FLOOD_DELAY = ANTI_FLOOD_DELAY
+irkerd.ANTI_BUZZ_DELAY = ANTI_BUZZ_DELAY
+irkerd.CONNECTION_MAX = CONNECTION_MAX
+irkerd.RECONNECT_DELAY = RECONNECT_DELAY
 
 LOG = logging.getLogger(__name__)
 LOG.setLevel(logging.ERROR)
 LOG_LEVELS = ['critical', 'error', 'warning', 'info', 'debug']
 
+# and our logging choices
+irkerd.LOG.setLevel(logging.ERROR)
+
 UNICODE_TYPE = str
 
+class IrccatTarget(Target):
+    "Represent a transmission target."
+    def __init__(self, channel, username, password, nick_template,
+                 realname=None, servername=HOST, port=6697, **kwargs):
+        self.servername = servername
+        self.port = port
+        self.username = username
+        self.password = password
+        self.nick = nick_template
+        self.realname = realname
+        self.kwargs = kwargs
+
+        # always use ssl
+        self.ssl = True
+        # we don't care about channel keys atm
+        self.key = ""
+
+        self.channel = channel.strip()
+        # IRC channel names are case-insensitive.  If we don't smash
+        # case here we may run into problems later. There was a bug
+        # observed on irc.rizon.net where an irkerd user specified #Channel,
+        # got kicked, and irkerd crashed because the server returned
+        # "#channel" in the notification that our kick handler saw.
+        self.channel = channel.lower()
+
+        if self.channel and self.channel[0] not in "#&+":
+            self.channel = "#" + self.channel
+
+    def validate(self, irc_valid_channels=None):
+        "Raise InvalidRequest if the URL is missing a critical component"
+        if not irc_valid_channels:
+            raise InvalidRequest(
+                'irc_valid_channels is empty')
+
+        if not self.channel:
+            raise InvalidRequest(
+                'request is missing a channel')
+
+        if self.channel not in irc_valid_channels:
+            raise InvalidRequest(
+                f'{self.channel} channel is not in list of valid channels')
+
 class Irccat(Irker):
-    nothing = True
+
+    def _parse_request(self, line):
+        "Request-parsing helper for the handle() method"
+        request = json.loads(line.strip())
+        if not isinstance(request, dict):
+            raise InvalidRequest(
+                "request is not a JSON dictionary: %r" % request)
+        if "to" not in request or "privmsg" not in request:
+            raise InvalidRequest(
+                "malformed request - 'to' or 'privmsg' missing: %r" % request)
+        channels = request['to']
+        message = request['privmsg']
+        if not isinstance(channels, (list, UNICODE_TYPE)):
+            raise InvalidRequest(
+                "malformed request - unexpected channel type: %r" % channels)
+        if not isinstance(message, UNICODE_TYPE):
+            raise InvalidRequest(
+                "malformed request - unexpected message type: %r" % message)
+        if not isinstance(channels, list):
+            channels = [channels]
+        targets = []
+
+        for channel in channels:
+            try:
+                if not isinstance(channel, UNICODE_TYPE):
+                    raise InvalidRequest(
+                        "malformed request - channel has unexpected type: %r" %
+                        channel)
+                target = IrccatTarget(channel, **self.kwargs)
+                target.validate(self.kwargs['irc_valid_channels'])
+            except InvalidRequest as e:
+                LOG.error("irccat: " + UNICODE_TYPE(e))
+            else:
+                targets.append(target)
+        return (targets, message)
+
+    def handle(self, line, quit_after=False):
+        "Perform a JSON relay request."
+        try:
+            targets, message = self._parse_request(line=line)
+            for target in targets:
+                if target.server() not in self.servers:
+                    self.servers[target.server()] = Dispatcher(
+                        self, target=target, **self.kwargs)
+                self.servers[target.server()].dispatch(
+                    target.channel, message, target.key, quit_after=quit_after)
+                # GC dispatchers with no active connections
+                servernames = self.servers.keys()
+                for servername in servernames:
+                    if not self.servers[servername].live():
+                        del self.servers[servername]
+                    # If we might be pushing a resource limit even
+                    # after garbage collection, remove a session.  The
+                    # goal here is to head off DoS attacks that aim at
+                    # exhausting thread space or file descriptors.
+                    # The cost is that attempts to DoS this service
+                    # will cause lots of join/leave spam as we
+                    # scavenge old channels after connecting to new
+                    # ones. The particular method used for selecting a
+                    # session to be terminated doesn't matter much; we
+                    # choose the one longest idle on the assumption
+                    # that message activity is likely to be clumpy.
+                    if len(self.servers) >= CONNECTION_MAX:
+                        oldest = min(
+                            self.servers.keys(),
+                            key=lambda name: self.servers[name].last_xmit())
+                        del self.servers[oldest]
+        except InvalidRequest as e:
+            LOG.error("irccat: " + UNICODE_TYPE(e))
+        except ValueError:
+            LOG.error("irccat: " + "can't recognize JSON on input: %r" % line)
+        except RuntimeError:
+            LOG.error("irccat: " + "wildly malformed JSON blew the parser stack.")
+
 
 def ssl_context_init(ca_file = None, ca_path = None, cert_file = None):
     # Create a context to consolidate SSL settings
@@ -95,19 +219,22 @@ def ssl_context_init(ca_file = None, ca_path = None, cert_file = None):
         ssl_context.load_verify_locations(cafile=ca_file, capath=ca_path)
     else:
         ssl_context.set_default_verify_paths()
-
-    LOG.info("ctx cert file %s", cert_file)
-    LOG.info("ctxca file %s", ca_file)
-    LOG.info("ctx ca path %s", ca_path)
-
-    #context.load_cert_chain(certfile,
-    #                    keyfile = cert_file)
-
-    # only for debugging as i'm not in the SNI
-    # add this as a param
-    ssl_context.verify_mode = ssl.CERT_NONE
+    # client contacting irccat won't have its own priv key cert
+    #ssl_context.verify_mode = ssl.CERT_NONE
 
     return ssl_context
+
+# from irkerd.py, had to copy it here because of the last
+# argument
+class IrccatTCPHandler(socketserver.StreamRequestHandler):
+    def handle(self):
+        while True:
+            line = self.rfile.readline()
+            if not line:
+                break
+            if not isinstance(line, UNICODE_TYPE):
+                line = UNICODE_TYPE(line, 'utf-8')
+            irccat.handle(line=line.strip())
 
 def in_background():
     "Is this process running in background?"
@@ -140,24 +267,42 @@ if __name__ == '__main__':
         '-H6', '--host6', metavar='ADDRESS', default=HOST,
         help='IPv6 address to listen on')
     parser.add_argument(
-        '-hp', '--port', metavar='NAME', default=PORT, type=int,
+        '-hp', '--port', metavar='PORT', default=PORT, type=int,
         help="host port to listen to for incoming requests")
     parser.add_argument(
-        '-ic', '--irc-channel', metavar='LIST', action="extend", nargs='+',
-        type=str,
-        help='list of irc channels irccat can connect to')
+        '-ivc', '--irc-valid-channels', metavar='LIST', action="extend", nargs='+',
+        help='list of irc channels irccat can post to')
+
+    parser.add_argument(
+        '-is', '--irc-server-name', metavar='NAME', default=IRC_HOST,
+        help='irc server name')
+    parser.add_argument(
+        '-isp', '--irc-port', metavar='PORT', type=int, default=IRC_PORT,
+        help='irc server port')
+    parser.add_argument(
+        '-iu', '--irc-username', metavar='NAME', default='irccat',
+        help='irc server account name')
+    password_group.add_argument(
+        '-ip', '--irc-password', metavar='PASSWORD',
+        help='irc server account password')
+    password_group.add_argument(
+        '-iP', '--irc-password-file', metavar='PATH', type=argparse.FileType('r'),
+        help='NickServ password from file')
+    parser.add_argument(
+        '-in', '--irc-nick', metavar='NAME', default='irccat%03d',
+        help="irc nickname (optionally with a '%%.*d' server connection marker)")
+    parser.add_argument(
+        '-ir', '--irc-realname', metavar='NAME',
+        default='irccat/irked relay bot',
+        help='irc real name string to associate with the bot')
+
     parser.add_argument(
         '-l', '--log-file', metavar='PATH',
         help='file for saving captured message traffic')
     parser.add_argument(
-        '-n', '--nick', metavar='NAME', default='irccat%03d',
-        help="nickname (optionally with a '%%.*d' server connection marker)")
-    password_group.add_argument(
-        '-p', '--password', metavar='PASSWORD',
-        help='NickServ password')
-    password_group.add_argument(
-        '-P', '--password-file', metavar='PATH', type=argparse.FileType('r'),
-        help='NickServ password from file')
+        '-V', '--version', action='version',
+        version='%(prog)s {0}'.format(version))
+
     parser.add_argument(
         '-t', '--timeout', metavar='TIMEOUT', type=float, default=5.0,
         help="connection timeout in seconds (default: 5.0)")
@@ -166,9 +311,6 @@ if __name__ == '__main__':
         help=(
             'send a single message to IRC-URL and exit.  The message is the '
             'first positional argument.'))
-    parser.add_argument(
-        '-V', '--version', action='version',
-        version='%(prog)s {0}'.format(version))
     parser.add_argument(
         'message', metavar='MESSAGE', nargs='?',
         help='message for --immediate mode')
@@ -186,21 +328,27 @@ if __name__ == '__main__':
         log_level = getattr(logging, args.log_level.upper())
         LOG.setLevel(log_level)
 
-    if args.password_file:
-        with args.file as f:
+    if args.irc_password_file:
+        with args.irc_password_file as f:
             # IRC passwords must be at most 128 bytes, and cannot contain a \n
-            args.password = f.read(128).split("\n")[0].strip()
+            args.irc_password = f.read(128).split("\n")[0].strip()
 
     irccat = Irccat(
         logfile=args.log_file,
-        nick_template=args.nick,
-        nick_needs_number=re.search('%.*d', args.nick),
-        password=args.password,
+        servername=args.irc_server_name,
+        port=args.irc_port,
+        username=args.irc_username,
+        password=args.irc_password,
+        nick_template=args.irc_nick,
+        nick_needs_number=re.search('%.*d', args.irc_nick),
+        realname=args.irc_realname,
+        irc_valid_channels=args.irc_valid_channels,
         cafile=args.ca_file,
         capath=args.ca_path,
         certfile=args.cert_file,
         timeout=args.timeout,
         )
+
     LOG.info("ircat/irkerd %s/%s", version, irkerd_version)
     if args.immediate:
         if not args.message:
@@ -222,11 +370,13 @@ if __name__ == '__main__':
             raise SystemExit(1)
         irccat.thread_launch()
         try:
-            tcpserver = socketserver.TCPServer((args.host, PORT), IrkerTCPHandler)
-            tcpserver.socket = context.wrap_socket (tcpserver.socket, server_side = True)
+            ssl_context = ssl_context_init(ca_file = args.ca_file, ca_path = args.ca_path,
+                                           cert_file = args.cert_file)
+            tcpserver = socketserver.TCPServer((args.host, args.port), IrccatTCPHandler)
+            tcpserver.socket = ssl_context.wrap_socket (tcpserver.socket, server_side = True)
             # pylint: disable=undefined-variable
-            tcp6server = TCP6Server((args.host6, PORT), IrkerTCPHandler)
-            tcp6server.socket = context.wrap_socket (tcp6server.socket, server_side = True)
+            tcp6server = TCP6Server((args.host6, args.port), IrccatTCPHandler)
+            tcp6server.socket = ssl_context.wrap_socket (tcp6server.socket, server_side = True)
             for server in [tcpserver, tcp6server]:
                 server = threading.Thread(target=server.serve_forever, daemon=True)
                 server.start()
